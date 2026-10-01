@@ -1,0 +1,12 @@
+{
+  "name": "CleanBite",
+  "short_name": "CleanBite",
+  "description": "Snap a food label, get a 0-100 health score.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#16a34a",
+  "icons": [
+    { "src": "/favicon.ico", "sizes": "any", "type": "image/x-icon" }
+  ]
+}

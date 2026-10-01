@@ -1,0 +1,11 @@
+npm notice run cleanbite@0.1.0 start
+npm notice run next start --port 3105
+▲ Next.js 16.3.8
+- Local:         http://localhost:3105
+- Network:       http://192.168.1.18:3105
+✓ Ready in 215ms
+⚠ Warning: Next.js ignored package-lock.json in C:\Users\hamza because it would include your home directory (C:\Users\hamza).
+ To use this directory, set `outputFileTracingRoot` in your Next.js config.
+
+✓ Running next.config.ts took 47ms
+^C
