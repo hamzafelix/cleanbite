@@ -36,6 +36,13 @@ yarn-error.log*
 # vercel
 .vercel
 
+# server/debug logs
+server*.log
+debug*.log
+
+# test data / product photos
+Test Products/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
