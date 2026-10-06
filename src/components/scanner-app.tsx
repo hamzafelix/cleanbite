@@ -9,6 +9,15 @@ import { Camera, History, ScanLine, Star, Trash2, Upload, X } from "lucide-react
 
 type Phase = "scan" | "loading" | "result" | "history";
 
+/**
+ * Ceiling for one scan. Generous, because a reasoning vision model legitimately
+ * takes a while, but finite so the UI can't hang indefinitely on a phone.
+ */
+const CLIENT_TIMEOUT_MS = 120_000;
+
+/** After this many seconds we show a reassurance hint under the spinner. */
+const SLOW_HINT_AFTER_S = 15;
+
 const SAMPLES: Record<string, ProductParse> = {
   cola: {
     product_name: "Cola (sample)", language_detected: "en",
@@ -74,6 +83,7 @@ export default function ScannerApp() {
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [savedTick, setSavedTick] = useState(false);
   const [ocrDebug, setOcrDebug] = useState<string>("");
+  const [elapsed, setElapsed] = useState(0);
 
   const t = getStrings(locale);
   const rtl = RTL_LOCALES.includes(locale);
@@ -117,47 +127,70 @@ export default function ScannerApp() {
       body = { images: photos, localeHint: locale, barcode: barcode.trim() || undefined, debug: true };
     }
     setPhase("loading");
-    try {
-      let data: { product: ProductParse; score: ScoreResult; explanation: string; debug?: unknown };
-      if (sampleKey) {
-        // local rescore of built-in sample (no network)
+
+    // Samples are a local rescore with no model call, so they need no budget.
+    if (sampleKey) {
+      try {
         const r = await fetch("/api/score", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ product: SAMPLES[sampleKey], locale }),
         });
-        data = await r.json();
+        const data = await r.json();
         data.product = SAMPLES[sampleKey];
-      } else {
-        const r = await fetch("/api/parse", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        data = await r.json();
-        if (data?.debug) {
-          setOcrDebug(JSON.stringify(data.debug, null, 2));
-          console.log("[cleanbite][ocr-debug]", data.debug);
+        setProduct(data.product); setScore(data.score); setExplanation(data.explanation);
+        setPhase("result");
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed");
+        setPhase("scan");
+      }
+      return;
+    }
+
+    // A vision model can take minutes on a dense label. Without a ceiling the
+    // spinner is an indefinite hang on a phone, so bound it and say so.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
+    setElapsed(0);
+    const tick = setInterval(() => setElapsed((s) => s + 1), 1000);
+    try {
+      let data: { product: ProductParse; score: ScoreResult; explanation: string; debug?: unknown };
+      const r = await fetch("/api/parse", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      data = await r.json();
+      if (data?.debug) {
+        setOcrDebug(JSON.stringify(data.debug, null, 2));
+        console.log("[cleanbite][ocr-debug]", data.debug);
+      }
+      if (!r.ok) {
+        if (data && (data as { error?: string }).error === "DEMO_MODE") {
+          setDemoMode(true);
+          setProduct(SAMPLES.cola);
+          const s = await (await fetch("/api/score", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ product: SAMPLES.cola, locale }),
+          })).json();
+          setScore(s.score); setExplanation(s.explanation);
+          setPhase("result");
+          return;
         }
-        if (!r.ok) {
-          if (data && (data as { error?: string }).error === "DEMO_MODE") {
-            setDemoMode(true);
-            setProduct(SAMPLES.cola);
-            const s = await (await fetch("/api/score", {
-              method: "POST", headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ product: SAMPLES.cola, locale }),
-            })).json();
-            setScore(s.score); setExplanation(s.explanation);
-            setPhase("result");
-            return;
-          }
-          throw new Error((data as { message?: string; error?: string }).message ?? (data as { error?: string }).error ?? "Failed");
-        }
+        throw new Error((data as { message?: string; error?: string }).message ?? (data as { error?: string }).error ?? "Failed");
       }
       setProduct(data.product); setScore(data.score); setExplanation(data.explanation);
       if ((data.product.confidence ?? 1) < 0.5) setError(t.lowConfidence);
       setPhase("result");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed");
+      // An abort is always our own deadline firing, never a server refusal.
+      if (controller.signal.aborted) setError(t.timedOut);
+      else setError(e instanceof Error ? e.message : "Failed");
       setPhase("scan");
+    } finally {
+      clearTimeout(timer);
+      clearInterval(tick);
+      setElapsed(0);
     }
   };
 
@@ -227,14 +260,33 @@ export default function ScannerApp() {
                 ))}
               </div>
             )}
+            {/* The file inputs must stay rendered: Safari will not open the camera
+                or file picker for a `display: none` input, even when a <label>
+                wraps it. So each input is stretched transparently over its button
+                and the tap lands on the input directly. `multiple` is deliberately
+                left off the camera input, since iOS ignores `capture` when it is set. */}
             <div className="flex flex-wrap gap-2">
-              <label className="flex cursor-pointer items-center gap-2 rounded-xl bg-black px-4 py-2.5 text-sm font-semibold text-white dark:bg-white dark:text-black">
+              <label className="relative flex cursor-pointer items-center gap-2 overflow-hidden rounded-xl bg-black px-4 py-2.5 text-sm font-semibold text-white dark:bg-white dark:text-black">
                 <Camera size={16} /> {t.takePhoto}
-                <input type="file" accept="image/*" capture="environment" multiple className="hidden" onChange={(e) => addFiles(e.target.files)} />
+                <input
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  aria-label={t.takePhoto}
+                  onChange={(e) => { addFiles(e.target.files); e.target.value = ""; }}
+                  className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                />
               </label>
-              <label className="flex cursor-pointer items-center gap-2 rounded-xl border px-4 py-2.5 text-sm font-semibold">
+              <label className="relative flex cursor-pointer items-center gap-2 overflow-hidden rounded-xl border px-4 py-2.5 text-sm font-semibold">
                 <Upload size={16} /> {t.upload}
-                <input type="file" accept="image/*" multiple className="hidden" onChange={(e) => addFiles(e.target.files)} />
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  aria-label={t.upload}
+                  onChange={(e) => { addFiles(e.target.files); e.target.value = ""; }}
+                  className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                />
               </label>
             </div>
           </div>
@@ -268,6 +320,15 @@ export default function ScannerApp() {
         <section className="mt-10 flex flex-col items-center gap-3 text-center">
           <div className="h-10 w-10 animate-spin rounded-full border-4 border-gray-200 border-t-green-600" />
           <p className="text-sm text-gray-500">{t.analyzing}</p>
+          {/* A visible clock turns an indefinite spinner into legible progress. */}
+          {elapsed > 0 && (
+            <p className="text-xs tabular-nums text-gray-400">
+              {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")}
+            </p>
+          )}
+          {elapsed >= SLOW_HINT_AFTER_S && (
+            <p className="max-w-xs text-xs text-gray-500">{t.slowHint}</p>
+          )}
         </section>
       )}
 

@@ -68,6 +68,20 @@ export const CMD_DEFAULT_BASE_URL = "https://api.commandcode.ai/provider/v1";
  */
 const CMD_MAX_TOKENS = Number(process.env.CMD_MAX_TOKENS) || 16000;
 
+/**
+ * Per-request budget for the upstream call. Reasoning vision models can take
+ * minutes on a dense label, so this is generous — but it must be finite, or a
+ * stalled upstream leaves the request hanging and the client spinning forever.
+ */
+const CMD_REQUEST_TIMEOUT_MS = Number(process.env.CMD_REQUEST_TIMEOUT_MS) || 90_000;
+
+function timeoutError(ms: number): Error {
+  return new Error(
+    `Command Code: no response after ${Math.round(ms / 1000)}s. The model is too slow for this label — ` +
+      `try one photo at a time, or lower CMD_MAX_TOKENS / use a non-reasoning model.`
+  );
+}
+
 function cmdConfig() {
   const apiKey = process.env.CMD_API_KEY;
   if (!apiKey) throw new Error("CMD_API_KEY not configured");
@@ -123,17 +137,32 @@ async function ocrRequest(
 
   log(`${label}: POST ${baseUrl}/chat/completions model=${model} photos=${images.length}`);
   const started = Date.now();
-  const res = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "user", content }],
-      temperature: 0.1,
-      max_tokens: CMD_MAX_TOKENS,
-      response_format: { type: "json_object" },
-    }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CMD_REQUEST_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content }],
+        temperature: 0.1,
+        max_tokens: CMD_MAX_TOKENS,
+        response_format: { type: "json_object" },
+      }),
+    });
+  } catch (e) {
+    // AbortError means our own budget expired, not that upstream refused.
+    if (controller.signal.aborted) {
+      log(`${label}: TIMEOUT after ${CMD_REQUEST_TIMEOUT_MS}ms`);
+      throw timeoutError(CMD_REQUEST_TIMEOUT_MS);
+    }
+    throw new Error(`Command Code: network error — ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    clearTimeout(timer);
+  }
   const ms = Date.now() - started;
   if (!res.ok) {
     const t = await res.text();
@@ -238,6 +267,8 @@ function mergeParses(parses: ProductParse[]): ProductParse {
  * Parse label images with Command Code (OpenAI-compatible /chat/completions).
  * Strategy: try all photos in one request; if that fails (multi-photo payloads
  * are the common failure), retry each photo individually and merge successes.
+ * The retries run concurrently, so worst-case latency is two round trips
+ * regardless of photo count.
  */
 export async function parseLabelImages(images: VisionImage[]): Promise<VisionResult> {
   const { apiKey, model, baseUrl } = cmdConfig();
@@ -287,23 +318,45 @@ export async function parseLabelImages(images: VisionImage[]): Promise<VisionRes
 
   // 2) per-photo fallback
   debug.strategy = "per-photo-merged";
+  // Fire every photo concurrently. Chaining these meant a 4-photo scan paid the
+  // model latency 5 times over (combined + 4 sequential retries), which is how a
+  // single label turned into a multi-minute spinner.
+  const outcomes = await Promise.all(
+    images.map(async (img, i) => {
+      try {
+        const { text } = await ocrRequest(apiKey, model, baseUrl, [img], `photo[${i}]`);
+        const attempt = tryParseLogged(text, `photo[${i}]`);
+        return {
+          record: {
+            photoIndex: i,
+            chars: text.length,
+            preview: text.slice(0, PREVIEW_CHARS),
+            parsedOk: attempt.ok,
+            error: attempt.ok ? undefined : attempt.error,
+          } satisfies VisionDebug["rawResponses"][number],
+          parsed: attempt.ok ? attempt.parsed : null,
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return {
+          record: {
+            photoIndex: i,
+            chars: 0,
+            preview: "",
+            parsedOk: false,
+            error: msg,
+          } satisfies VisionDebug["rawResponses"][number],
+          parsed: null,
+        };
+      }
+    })
+  );
+  // Keep rawResponses ordered by photo index regardless of completion order.
+  outcomes.sort((a, b) => a.record.photoIndex - b.record.photoIndex);
   const successes: ProductParse[] = [];
-  for (let i = 0; i < images.length; i++) {
-    try {
-      const { text } = await ocrRequest(apiKey, model, baseUrl, [images[i]], `photo[${i}]`);
-      const attempt = tryParseLogged(text, `photo[${i}]`);
-      debug.rawResponses.push({
-        photoIndex: i,
-        chars: text.length,
-        preview: text.slice(0, PREVIEW_CHARS),
-        parsedOk: attempt.ok,
-        error: attempt.ok ? undefined : attempt.error,
-      });
-      if (attempt.ok) successes.push(attempt.parsed);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      debug.rawResponses.push({ photoIndex: i, chars: 0, preview: "", parsedOk: false, error: msg });
-    }
+  for (const o of outcomes) {
+    debug.rawResponses.push(o.record);
+    if (o.parsed) successes.push(o.parsed);
   }
   debug.durationMs = Date.now() - started;
   if (successes.length === 0) {
